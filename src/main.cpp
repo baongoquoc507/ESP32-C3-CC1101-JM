@@ -10,21 +10,26 @@
 #define LED_PIN     8   // Den onboard ESP32-C3 super mini
 
 // Thoi gian dung lai tren moi tan so (ms)
-#define DWELL_TIME_MS 200
+#define DWELL_TIME_MS 120
 
 // ===================== DANH SACH TAN SO SUB-GHZ =====================
 // Lay theo phong cach ESP-C3-Pocket-Puter: quet vong toan bo dai tan
 const float jam_frequency_list[] = {
-  300.000f, 302.757f, 303.875f, 303.900f, 304.250f, 307.000f, 307.500f,
-  307.800f, 309.000f, 310.000f, 312.000f, 312.100f, 312.200f, 313.000f,
-  313.850f, 314.000f, 314.350f, 314.980f, 315.000f, 318.000f, 330.000f,
-  345.000f, 348.000f, 350.000f,
-  387.000f, 390.000f, 418.000f, 430.000f, 430.500f, 431.000f, 431.500f,
-  433.075f, 433.220f, 433.420f, 433.657f, 433.889f, 433.920f, 434.075f,
-  434.177f, 434.190f, 434.390f, 434.420f, 434.620f, 434.775f, 438.900f,
-  440.175f, 464.000f, 467.750f,
-  779.000f, 868.350f, 868.400f, 868.800f, 868.950f, 906.400f, 915.000f,
-  925.000f, 928.000f
+  // === Dai 315 MHz (chia khoa o to, remote cua cuon gia re tai VN) ===
+  314.900f, 315.000f, 315.100f, 315.200f, 315.300f,
+  318.000f, 330.000f, 345.000f, 348.000f, 350.000f,
+
+  // === Dai 433.05 - 434.79 MHz (ISM VN: cua cuon, bao trom, den, quat...) ===
+  // Quet day tung buoc 0.05 MHz de phu kin toan dai
+  433.050f, 433.100f, 433.150f, 433.200f, 433.250f, 433.300f, 433.350f,
+  433.400f, 433.450f, 433.500f, 433.550f, 433.600f, 433.650f, 433.700f,
+  433.750f, 433.800f, 433.850f, 433.889f, 433.920f, 433.950f, 434.000f,
+  434.050f, 434.100f, 434.150f, 434.177f, 434.190f, 434.200f, 434.250f,
+  434.300f, 434.350f, 434.390f, 434.400f, 434.420f, 434.450f, 434.500f,
+  434.550f, 434.600f, 434.650f, 434.700f, 434.750f, 434.790f,
+
+  // === Dai 868 MHz (mot so thiet bu nhap khau Chau Au dung tai VN) ===
+  868.000f, 868.300f, 868.350f, 868.400f, 868.500f, 868.800f, 868.950f
 };
 const int jam_frequency_count = sizeof(jam_frequency_list) / sizeof(jam_frequency_list[0]);
 
@@ -62,7 +67,7 @@ void setup() {
   startJamFreq(jam_frequency_list[0]);
   dwellTimer = millis();
 
-  Serial.print(F("Jamming ")); Serial.print(jam_frequency_count); Serial.println(F(" frequencies..."));
+  Serial.print(F("Jamming VN bands - ")); Serial.print(jam_frequency_count); Serial.println(F(" frequencies..."));
   digitalWrite(LED_PIN, LOW);
 }
 
