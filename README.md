@@ -1,40 +1,20 @@
-# ESP-C3-Jammer (Standalone)
+# ESP-C3-DeauthDetector
 
-Firmware **jammer SubGHz doc lap** cho ESP32-C3.
+Phat hien tan cong **Deauth WiFi** bang ESP32-C3.
 
-- ❌ Khong WiFi
-- ❌ Khong man hinh OLED
-- ❌ Khong nut bam
-- ✅ **Cam nguon vao la tu dong gay nhieu toan bo dai tan**
+- Phat WiFi AP: `Quốc Bảo` / `12345678` → vao **http://192.168.4.1**
+- Nghe promiscuous tren kenh 2.4GHz da chon
+- Hien thi cac mang WiFi xung quanh (SSID, MAC, kenh, RSSI)
+- Dem va log cac frame DEAUTH (0xC0) - bao dong tren web + LED GPIO8
+- Doi kenh thu tu web (1-13)
 
-## Nguyen ly hoat dong
-CC1101 duoc dat o che do phat truc tiep (async serial data), liên tục chuyển đổi
-ngẫu nhiên mức tín hiệu (OOK noise) và **quét vòng qua toàn bộ danh sách tần số**
-Sub-GHz (300MHz → 928MHz, gồm cả 315 / 433.92 / 868 / 915 MHz).
+## Su dung
+1. Nap firmware (PlatformIO: `pio run --target upload`, hoac flash file
+   `firmware.bin` trong Releases bang esptool)
+2. Noi WiFi `Quốc Bảo` / `12345678`, mo trinh duyet vao 192.168.4.1
+3. Chon kenh WiFi can giam sat -> Set Channel
+4. Khi co deauth attack, web hien canh bao do + LED nhap nhay
 
-## Cam day (giong sơ đồ cũ ESP-GRABER)
-| CC1101 | ESP32-C3 |
-|--------|----------|
-| SCK  | GPIO 4 |
-| MISO | GPIO 6 |
-| MOSI | GPIO 7 |
-| CS   | GPIO 5 |
-| GDO0 | GPIO 10 |
-
-## Nap code
-### PlatformIO
-`pio run --target upload`
-
-### Firmware co san
-Tu dong build bang GitHub Actions (xem Releases), nap bang esptool:
-```bash
-esptool.py --chip esp32c3 --port COMx write_flash 0x0 firmware.bin
-```
-
-## ⚠️ CANH BAO PHAP LY
-Gay nhieu song vo tuyen la **bat hop phap** o hau het cac quoc gia (bao gom Viet Nam -
-Nghi dinh 02/2023/ND-CP). Chi su dung cho muc dich hoc tap, thu nghiem trong moi truong
-kin, tren thiet bi cua ban va co su cho phep. Moi hau qua phap ly thuoc ve nguoi su dung.
-# ESP-GRABER-Web
-# ESP32-C3-CC1101-JM
-# ESP32-C3-CC1101-JM
+## Luu y
+Che do promiscuous chay dong thoi voi AP nen chi nghe duoc tren 1 kenh tai
+mot thoi diem. Chon dung kenh cua mang can bao ve.
